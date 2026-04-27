@@ -3,6 +3,7 @@ const authRoutes = require("./routes/authRoutes");
 const contentRoutes = require("./routes/contentRoutes");
 const approvalRoutes = require("./routes/approvalRoutes");
 const path = require("path");
+const broadcastRoutes = require("./routes/broadcastRoutes");
 const app = express();
 require("dotenv").config();
 
@@ -15,7 +16,7 @@ app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 app.use("/api/auth", authRoutes);
 app.use("/api/content", contentRoutes);
 app.use("/api/approvals", approvalRoutes);
-
+app.use("/api", broadcastRoutes);
 app.use((err, req, res, next) => {
   console.error(err.stack);
 
