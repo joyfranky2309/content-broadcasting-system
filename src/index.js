@@ -1,4 +1,5 @@
 const express = require("express");
+const rateLimit = require("express-rate-limit");
 const redisClient = require("./utils/redisClient");
 const authRoutes = require("./routes/authRoutes");
 const contentRoutes = require("./routes/contentRoutes");
@@ -14,10 +15,19 @@ app.use(express.json());
 // Serve uploaded files as static files
 app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 
+// Rate limiter for broadcast route - 100 requests per 15 minutes per IP
+const broadcastLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requests per windowMs
+  message: "Too many requests from this IP, please try again later.",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use("/api/auth", authRoutes);
 app.use("/api/content", contentRoutes);
 app.use("/api/approvals", approvalRoutes);
-app.use("/api", broadcastRoutes);
+app.use("/api/content/live", broadcastLimiter, broadcastRoutes);
 app.use((err, req, res, next) => {
   console.error(err.stack);
 
