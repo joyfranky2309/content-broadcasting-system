@@ -1,0 +1,163 @@
+Authentication & RBAC flow:
+JWT tokens are issued on login containing: userId, role, and signed with JWT_SECRET. Each protected request must include the token in the Authorization header as "Bearer <token>".
+
+RBAC Implementation:
+- **Teacher role**: Can upload content (POST /api/content/upload) and submit for review (POST /api/content/:contentId/submit). Content starts in 'uploaded' status, then transitions to 'pending' when submitted.
+- **Principal role**: Can view pending content (GET /api/approvals/pending), approve (PUT /api/approvals/:contentId/approve), or reject (PUT /api/approvals/:contentId/reject) content. Approval sets status='approved', rejected sets status='rejected'.
+- **No authentication required**: Students access the public broadcast API (GET /api/content/live/:teacherId) without logging in, rate-limited to 100 requests/15 minutes per IP.
+
+Key fields for auth:
+- users.role: Determines which routes/actions user can access (enforced via verifyRole middleware)
+- content.status: Tracks approval workflow state (uploaded → pending → approved/rejected)
+- content.approved_by: Records which principal approved (userId)
+- content.approved_at: Timestamp used as cycle start point for rotation calculations
+
+Subject-based system design:
+Each subject gets exactly one content_slot, preventing conflicts and duplicate scheduling. When a teacher uploads content with a subject, the system checks if a slot exists for that subject:
+- If slot exists: Content is assigned to that slot with a rotation_order
+- If slot doesn't exist: A new slot is automatically created
+
+Key fields:
+- content.subject: Links content to a slot
+- content_schedule.rotation_order: Determines order (1, 2, 3, etc.)
+- content_schedule.duration: Minutes each content displays before rotating to the next
+
+Upload handling approach:
+Files are uploaded via multipart/form-data and handled by multer middleware. Multer validates file type (jpg, png, gif only) and enforces a 10MB size limit. Validated files are saved to the /uploads directory with a timestamp-based unique filename.
+
+Key fields:
+- content.file_url: Path to the uploaded file
+- content.file_type: MIME type for content delivery
+- content.file_size: For bandwidth estimation and storage tracking
+
+Approval workflow design:
+The content lifecycle follows a 3-stage workflow:
+1. **Upload (status='uploaded')**: Teacher uploads content. Content is stored but not yet visible to students.
+2. **Submit for Review (status='pending')**: Teacher submits content for approval. Principal can now review it.
+3. **Approval/Rejection (status='approved' or 'rejected')**: Principal reviews pending content and either approves (makes it visible to students) or rejects (with a reason).
+
+Key validations:
+- Content cannot be re-approved if already in 'approved' or 'rejected' state (prevents accidental overwrites)
+- Rejection requires a rejection_reason
+- Only approved content (status='approved') appears in the public broadcast feed
+- approved_at timestamp marks when the principal approved the content
+
+Key fields:
+- content.status: Workflow state machine
+- content.approved_by: Principal's userId who approved
+- content.approved_at: Approval timestamp (used as cycle start for rotation)
+- content.rejection_reason: Explanation if rejected
+- content.start_time / end_time: Time window when content is eligible for broadcasting
+
+Scheduling/rotation logic:
+The core algorithm in getActiveContent(teacherId) calculates which content should be "live" at the current moment using round-robin scheduling with duration weights.
+
+Algorithm steps:
+1. Query: Fetch all approved content for the teacher that's within start_time/end_time window, ordered by rotation_order
+2. Calculate total cycle time: Sum all duration values across all content items
+3. Find cycle start: Use the earliest approved_at timestamp as the baseline
+4. Calculate elapsed time: Difference between now and cycle start (in minutes)
+5. Apply modulo: position = elapsed_time % total_cycle_time (wraps the position within the cycle)
+6. Find active item: Walk through items checking cumulative duration ranges until finding which item's range contains the current position
+7. Return: The active content item
+
+Redis optimization: Cache the result with 60-second TTL. Subsequent requests within 60 seconds hit the cache instead of querying the database, reducing load.
+
+Example:
+- Content A: duration 5 min, rotation_order 1
+- Content B: duration 3 min, rotation_order 2
+- Total cycle = 8 minutes
+- If elapsed_time = 13 minutes: position = 13 % 8 = 5 minutes
+- Position 5 falls in Content B's range (5-7 minutes), so Content B is returned
+
+Database design decisions:
+The application uses 4 tables with normalized design to separate concerns and enable scalability:
+
+1. **users** table: Stores user credentials and role information.
+   - Fields: id (PK), name, email, password_hash, role (principal/teacher), created_at
+   - Purpose: Authentication, user identification, role-based access control
+
+2. **content** table: Stores the actual content metadata and workflow state.
+   - Fields: id (PK), title, description, subject, file_url, file_type, file_size, uploaded_by (FK), status (uploaded/pending/approved/rejected), rejection_reason, approved_by (FK), approved_at, start_time, end_time, created_at
+   - Purpose: Central content store that tracks the full approval workflow (upload → pending → approved/rejected)
+   - Key insight: Status field enables the approval workflow. Teachers upload content (status='uploaded'), submit for review (status='pending'), and principals approve (status='approved') or reject (status='rejected')
+
+3. **content_slots** table: Represents time slots allocated per subject.
+   - Fields: id (PK), subject (UNIQUE), created_at
+   - Purpose: One slot per subject ensures no duplicate/conflicting content slots for the same subject. This enforces the constraint that each subject has a single rotation schedule
+   - Why separate: Avoids data duplication - multiple content items can reference the same slot
+
+4. **content_schedule** table: Maps content to slots with rotation parameters.
+   - Fields: id (PK), content_id (FK), slot_id (FK), rotation_order, duration, created_at
+   - Purpose: Defines the rotation order and duration (in minutes) for each content item within a subject's slot
+   - Why separate from content: Separation of concerns. Content metadata (what, when) vs scheduling logic (how to rotate). One content can theoretically be in multiple schedules; one slot can have multiple content items in rotation order
+   - Key use case: Enables the round-robin scheduling algorithm - duration values let us calculate which content should be "live" at any given moment using modulo arithmetic
+
+Folder structure:
+The project follows a layered architecture organized as follows:
+
+- **src/**: Main application directory
+  - **controllers/**: Request handlers for each feature
+    - authController.js: registerUser, loginUser logic
+    - uploadController.js: uploadContent, submitContent logic (teachers upload and submit content)
+    - approvalController.js: approveContent, rejectContent, getPendingContent logic (principals review content)
+    - broadcastController.js: getLiveContent logic (public API for students)
+  - **routes/**: Express route definitions mapping URLs to controllers
+    - authRoutes.js: POST /api/auth/register, /login
+    - contentRoutes.js: POST /api/content/upload, POST /api/content/:contentId/submit (teacher routes)
+    - approvalRoutes.js: GET /api/approvals/pending, PUT /api/approvals/:contentId/approve, PUT /api/approvals/:contentId/reject (principal routes)
+    - broadcastRoutes.js: GET /api/content/live/:teacherId (public, rate-limited route for students)
+  - **middlewares/**: Express middleware for cross-cutting concerns
+    - authMiddleware.js: verifyToken (JWT validation), verifyRole (role-based access control)
+    - uploadMiddleware.js: Multer configuration for file upload handling, file type/size validation
+  - **services/**: Business logic and data access patterns
+    - schedulingService.js: getActiveContent - core rotation algorithm with Redis caching. Queries approved content, calculates elapsed time since approval, applies modulo math to determine which content is "live" now
+  - **utils/**: Utility modules
+    - db.js: PostgreSQL connection pool configuration
+    - redisClient.js: Redis client for caching (v4+ compatible)
+  - **models/**: Database schema
+    - schema.sql: DDL for all 4 tables with constraints and foreign keys
+  - index.js: Express app setup, route mounting, error handling, server startup
+
+- **uploads/**: Directory where multer saves uploaded files on disk
+
+- **.gitignore**: Excludes node_modules, .env, uploads, and IDE files from version control
+
+Middleware usage:
+**authMiddleware.js**:
+- verifyToken: Extracts JWT from Authorization header, validates signature. Fails if token missing or invalid. Sets req.user with decoded token data (userId, role).
+- verifyRole(role): Returns middleware that checks if req.user.role matches required role. Returns 403 Forbidden if unauthorized.
+
+**uploadMiddleware.js**:
+- Multer file upload handler with diskStorage configuration
+- fileFilter: Validates MIME type and extension (jpg, png, gif only)
+- limits: Enforces 10MB max file size
+- Stores files in /uploads directory with unique names to prevent overwrites
+
+**Applied to routes**:
+- /api/auth/* : No middleware (public)
+- /api/content/upload : verifyToken + verifyRole('teacher') + upload.single('file')
+- /api/content/:contentId/submit : verifyToken + verifyRole('teacher')
+- /api/approvals/* : verifyToken + verifyRole('principal')
+- /api/content/live/:teacherId : Rate limiter (no auth needed, public)
+
+Scalability approach:
+**Redis Caching**: The getActiveContent function caches results for 60 seconds. This dramatically reduces database queries since most users access the same teacher's content within short time windows. With 100 students viewing the same teacher's broadcast, ~99% of requests hit the cache.
+
+**Rate Limiting**: The public broadcast endpoint (/api/content/live) is rate-limited to 100 requests/15 minutes per IP. This prevents:
+- Bot attacks that could overwhelm the database
+- Excessive bandwidth usage
+- DDoS-style abuse
+- Protects the free-tier database from abuse spikes
+
+**Designed for horizontal scaling**:
+- Stateless controllers: No session state in memory
+- Redis for distributed caching: Multiple app instances share the same cache
+- JWT for auth: No server-side session storage needed
+- Database connection pooling: Efficient resource usage
+
+**Current limitations & future improvements**:
+- Single server (not behind load balancer)
+- Local disk file storage (switch to S3 for multi-server deployment)
+- Database not replicated (add read replicas for read-heavy loads)
+- Redis not replicated (add Redis Sentinel for HA)
