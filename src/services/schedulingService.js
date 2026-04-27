@@ -1,7 +1,16 @@
 const pool = require("../utils/db");
+const redisClient = require("../utils/redisClient");
 
 const getActiveContent = async (teacherId) => {
     try {
+        const cacheKey = `active_content:${teacherId}`;
+
+        // Check Redis cache first
+        const cachedResult = await redisClient.get(cacheKey);
+        if (cachedResult) {
+            return JSON.parse(cachedResult);
+        }
+
         const query = `
             SELECT c.*, cs.rotation_order, cs.duration 
             FROM content c 
@@ -44,6 +53,8 @@ const getActiveContent = async (teacherId) => {
 
             // Check if current position falls within this item's range
             if (positionInCycle >= cumulativeTime && positionInCycle < nextCumulativeTime) {
+                // Store result in Redis with 60 second TTL
+                await redisClient.setEx(cacheKey, 60, JSON.stringify(item));
                 return item;
             }
 
@@ -51,7 +62,9 @@ const getActiveContent = async (teacherId) => {
         }
 
         // Fallback to first item (shouldn't reach here with correct logic)
-        return items[0];
+        const activeItem = items[0];
+        await redisClient.setEx(cacheKey, 60, JSON.stringify(activeItem));
+        return activeItem;
     } catch (error) {
         throw error;
     }

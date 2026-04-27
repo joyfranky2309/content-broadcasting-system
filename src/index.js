@@ -1,4 +1,5 @@
 const express = require("express");
+const redisClient = require("./utils/redisClient");
 const authRoutes = require("./routes/authRoutes");
 const contentRoutes = require("./routes/contentRoutes");
 const approvalRoutes = require("./routes/approvalRoutes");
