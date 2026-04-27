@@ -8,7 +8,11 @@ const path = require("path");
 const broadcastRoutes = require("./routes/broadcastRoutes");
 const app = express();
 require("dotenv").config();
-
+const fs = require('fs');
+const uploadsDir = path.join(__dirname, '../uploads');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+}
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
